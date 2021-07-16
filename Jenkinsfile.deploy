@@ -4,16 +4,19 @@ helper = null
 
 pipeline {
     agent {
-        label 'kogito-operator-slave && !master'
+        label 'crc' // TODO move label to job generation ?
     }
 
     // Needed for local build
-    tools {
-        jdk 'kie-jdk11'
-    }
+    // TODO remove once temp solution is back
+    // tools {
+    //     jdk 'kie-jdk11'
+    //     maven 'kie-maven-3.6.3'
+    // }
 
     options {
-        timeout(time: 360, unit: 'MINUTES')
+        timestamps()
+        timeout(time: 720, unit: 'MINUTES')
     }
 
     // parameters {
@@ -23,14 +26,32 @@ pipeline {
     environment {
         // Static env is defined into .jenkins/dsl/jobs.groovy file
 
-        JAVA_HOME = "${GRAALVM_HOME}"
-
         BOT_BRANCH_HASH = "${util.generateHash(10)}"
 
         // Environment required by OLM tests when run from process
         OP_TEST_CONTAINER_OPT = '-t'
         OP_TEST_DEBUG = 1
         OP_TEST_CONTAINER_TOOL = 'docker'
+
+        CRC_ENABLED = true // TODO should be moved to job generation
+
+        GOLANG_VERSION = '1.14.15'
+        GOLANG_DIR = "/tmp/golang-bin/${GOLANG_VERSION}"
+        GOROOT = "${GOLANG_DIR}/go"
+        GOPATH = "${GOLANG_DIR}/gopath"
+        GOENV = "${GOLANG_DIR}/goenv"
+        GOCACHE = "${GOLANG_DIR}/gocache"
+
+        CRC_API = 'https://api.crc.testing:6443/'
+
+        MVN_VERSION = '3.6.3'
+        MVN_DIR = "/tmp/maven-bin/${MVN_VERSION}"
+
+        GRAALVM_VERSION = '21.1.0'
+        GRAALVM_DIR = "/tmp/graalvm-bin/${MVN_VERSION}"
+        JAVA_HOME = "${GRAALVM_DIR}/graalvm-ce-java11-${GRAALVM_VERSION}"
+
+        PATH = "${HOME}/.local/bin:${GOROOT}/bin:${GOPATH}/bin:${MVN_DIR}/apache-maven-${MVN_VERSION}/bin:${JAVA_HOME}/bin:${PATH}"
     }
 
     stages {
@@ -58,7 +79,51 @@ pipeline {
                     }
 
                     // Verify we have the connectivity to Openshift
-                    openshift.loginOpenshift()
+                    if (CRC_ENABLED) {
+                        timeout(time: 30, unit: 'MINUTES') {
+                            waitUntil {
+                                boolean crcStarted = fileExists(file: "${HOME}/.crc_started")
+                                echo "Checking availability of CRC... ${crcStarted ? 'OK' : 'KO'}"
+                                return crcStarted
+                            }
+                        }
+                    } else {
+                        openshift.loginOpenshift()
+                    }
+
+                    // TODO temp solution
+                    dir("${GRAALVM_DIR}") {
+                        sh """
+                            wget --no-verbose https://github.com/graalvm/graalvm-ce-builds/releases/download/vm-${GRAALVM_VERSION}/graalvm-ce-java11-linux-amd64-${GRAALVM_VERSION}.tar.gz
+                            tar xzvf graalvm-ce-java11-linux-amd64-${GRAALVM_VERSION}.tar.gz
+                            java -version
+                            echo \$JAVA_HOME
+                        """
+                    }
+                    dir("${MVN_DIR}") {
+                        sh """
+                            wget --no-verbose https://miroir.univ-lorraine.fr/apache/maven/maven-3/${MVN_VERSION}/binaries/apache-maven-${MVN_VERSION}-bin.tar.gz
+                            tar xzvf apache-maven-${MVN_VERSION}-bin.tar.gz
+                            mvn --version
+                        """
+                    }
+                    // END Temp solution
+
+                    sh '''
+                        source /home/hudson/cekit/bin/activate
+                        cekit --help
+                        pip3 install -U ansible
+                        ansible --version
+                    '''
+
+                    // Install golang
+                    dir("${GOLANG_DIR}") {
+                        sh """
+                            wget --no-verbose https://golang.org/dl/go${GOLANG_VERSION}.linux-amd64.tar.gz
+                            tar -xzf go${GOLANG_VERSION}.linux-amd64.tar.gz
+                            go version
+                        """
+                    }
                 }
             }
             post {
@@ -104,20 +169,23 @@ pipeline {
             }
         }
 
-        stage('Test Kogito Operator & CLI') {
-            when {
-                expression {
-                    return helper.shouldLaunchTests()
-                }
-            }
-            steps {
-                sh 'make test'
-            }
-        }
+        // stage('Test Kogito Operator & CLI') {
+        //     when {
+        //         expression {
+        //             return helper.shouldLaunchTests()
+        //         }
+        //     }
+        //     steps {
+        //         sh 'make test'
+        //     }
+        // }
 
         stage('Build Kogito Operator') {
             steps {
-                sh "make BUILDER=${env.CONTAINER_ENGINE}"
+                sh """
+                    source /home/hudson/cekit/bin/activate
+                    make BUILDER=${env.CONTAINER_ENGINE}
+                """
             }
         }
 
@@ -133,16 +201,22 @@ pipeline {
                 }
             }
         }
-        stage('Run OLM tests') {
-            when {
-                expression {
-                    return helper.shouldLaunchTests()
-                }
-            }
-            steps {
-                sh 'make olm-tests'
-            }
-        }
+
+        // No docker on CRC node ... need it ?
+        // stage('Run OLM tests') {
+        //     when {
+        //         expression {
+        //             return helper.shouldLaunchTests()
+        //         }
+        //     }
+        //     steps {
+        //         sh '''
+        //             source /home/hudson/cekit/bin/activate
+        //             make olm-tests
+        //         '''
+        //     }
+        // }
+
         stage('Push Operator Image to Openshift Registry') {
             steps {
                 script {
@@ -161,17 +235,18 @@ pipeline {
                     return helper.shouldLaunchTests()
                 }
             }
-            options {
-                // Lock on OCP API as we want only one run at a time
-                lock("BDD tests on OCP API ${getLockOpenshiftApi()}")
-            }
+            // TODO temp disable
+            // options {
+            //     // Lock on OCP API as we want only one run at a time
+            //     lock("BDD tests on OCP API ${getLockOpenshiftApi()}")
+            // }
             steps {
                 script {
                     // Catch and set unstable so the temp image is still pushed and we get the deployment properties,
                     // in case we decide to continue in the release
                     try {
                         // Use docker because of https://issues.redhat.com/browse/KOGITO-3512
-                        sh "make run-tests timeout=360 load_factor=1 concurrent=3 smoke=${params.SMOKE_TESTS_ONLY} ${getBDDParameters()}"
+                        sh "make run-tests timeout=720 load_factor=5 concurrent=2 smoke=${params.SMOKE_TESTS_ONLY} ${getBDDParameters()}"
                     } catch (err) {
                         unstable('Tests are failing')
                     }
@@ -191,17 +266,18 @@ pipeline {
         stage('Push to registry') {
             steps {
                 script {
-                    helper.loginRegistry()
+                    echo "$STAGE_NAME"
+                    // helper.loginRegistry()
 
-                    container.tagImage(helper.buildTempOpenshiftImageFullName(), helper.getImageFullTag(env.OPERATOR_IMAGE_NAME))
-                    container.pushImage(helper.getImageFullTag(env.OPERATOR_IMAGE_NAME))
+                    // container.tagImage(helper.buildTempOpenshiftImageFullName(), helper.getImageFullTag(env.OPERATOR_IMAGE_NAME))
+                    // container.pushImage(helper.getImageFullTag(env.OPERATOR_IMAGE_NAME))
 
-                    // Store image deployment information
-                    properties.add(helper.getImageRegistryProperty(), helper.getImageRegistry())
-                    properties.add(helper.getImageNamespaceProperty(), helper.getImageNamespace())
-                    properties.add(helper.getImageNamePrefixProperty(), helper.getImageNamePrefix())
-                    properties.add(helper.getImageNameSuffixProperty(), helper.getImageNameSuffix())
-                    properties.add(helper.getImageTagProperty(), helper.getImageTag())
+                    // // Store image deployment information
+                    // properties.add(helper.getImageRegistryProperty(), helper.getImageRegistry())
+                    // properties.add(helper.getImageNamespaceProperty(), helper.getImageNamespace())
+                    // properties.add(helper.getImageNamePrefixProperty(), helper.getImageNamePrefix())
+                    // properties.add(helper.getImageNameSuffixProperty(), helper.getImageNameSuffix())
+                    // properties.add(helper.getImageTagProperty(), helper.getImageTag())
                 }
             }
         }
@@ -240,6 +316,7 @@ pipeline {
         cleanup {
             script {
                 util.cleanNode(containerEngine)
+                sh "sudo rm -rf ${GOLANG_DIR}"
             }
         }
     }
@@ -251,8 +328,12 @@ String getOperatorVersion() {
 
 // Special method to get the Openshift API in the lock because env is not accessible yet
 void getLockOpenshiftApi() {
-    withCredentials([string(credentialsId: 'OPENSHIFT_API', variable: 'OPENSHIFT_API')]) {
-        return env.OPENSHIFT_API
+    if (env.CRC_ENABLED) {
+        return env.CRC_API
+    } else {
+        withCredentials([string(credentialsId: 'OPENSHIFT_API', variable: 'OPENSHIFT_API')]) {
+            return env.OPENSHIFT_API
+        }
     }
 }
 
