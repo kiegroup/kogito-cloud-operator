@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -161,32 +162,58 @@ func ExecuteHTTPRequestWithStringResponse(namespace string, requestInfo HTTPRequ
 	if err != nil {
 		return "", err
 	}
-	if !checkHTTPResponseSuccessful(httpResponse) {
-		return "", nil
-	}
-	// Check response
-	defer httpResponse.Body.Close()
-	buf := new(bytes.Buffer)
-	if _, err = buf.ReadFrom(httpResponse.Body); err != nil {
-		return "", err
-	}
-	resultBody := buf.String()
 
-	GetLogger(namespace).Debug("Retrieved", "resdultBody", resultBody)
+	resultBody := getResultBodyFromResponse(httpResponse)
+	GetLogger(namespace).Debug("Retrieved", "resultBody", resultBody)
+
 	return resultBody, nil
 }
 
 // ExecuteHTTPRequestWithUnmarshalledResponse executes an HTTP request and returns response unmarshalled into specific structure in case there is no error
 func ExecuteHTTPRequestWithUnmarshalledResponse(namespace string, requestInfo HTTPRequestInfo, response interface{}) error {
-	resultBody, err := ExecuteHTTPRequestWithStringResponse(namespace, requestInfo)
+	httpResponse, err := ExecuteHTTPRequest(namespace, requestInfo)
 	if err != nil {
 		return err
 	}
 
-	if err := json.NewDecoder(strings.NewReader(resultBody)).Decode(response); err != nil {
-		return err
+	resultBody := getResultBodyFromResponse(httpResponse)
+	contentType := getContentTypeFromResponse(httpResponse)
+
+	if strings.Contains(contentType, "application/json") {
+		if err := json.NewDecoder(strings.NewReader(resultBody)).Decode(response); err != nil {
+			return err
+		}
+	} else if strings.Contains(contentType, "application/xml") {
+		// TODO
+		// if err := xml.NewDecoder(strings.NewReader(resultBody)).Decode(response); err != nil {
+		// 	return err
+		// }
+	} else {
+		return errors.New("Response content type not recognized. Neither xml nor json")
 	}
+
 	return nil
+}
+
+func getResultBodyFromResponse(httpResponse *http.Response) string {
+	if !checkHTTPResponseSuccessful(httpResponse) {
+		return ""
+	}
+	// Check response
+	defer httpResponse.Body.Close()
+	buf := new(bytes.Buffer)
+
+	if _, err := buf.ReadFrom(httpResponse.Body); err != nil {
+		return ""
+	}
+
+	resultBody := buf.String()
+	return resultBody
+}
+
+func getContentTypeFromResponse(httpResponse *http.Response) string {
+	contentType := httpResponse.Header["Content-Type"][0]
+	return contentType
 }
 
 // IsHTTPRequestSuccessful makes and checks whether an http request is successful
